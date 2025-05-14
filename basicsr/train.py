@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings('ignore')
 import datetime
 import sys
 import os
@@ -15,6 +17,8 @@ from os import path as osp
 
 from basicsr.data import build_dataloader, build_dataset
 from basicsr.data.data_sampler import EnlargedSampler
+from basicsr.data.processing import SyntheticBurstProcessing
+import basicsr.data.burst_transforms as tfm
 from basicsr.data.prefetch_dataloader import CPUPrefetcher, CUDAPrefetcher
 from basicsr.models import build_model
 from basicsr.utils import (AvgTimer, MessageLogger, check_resume, get_env_info, get_root_logger, get_time_str,
@@ -39,6 +43,27 @@ def create_train_val_dataloader(opt, logger):
     train_loader, val_loaders = None, []
     for phase, dataset_opt in opt['datasets'].items():
         if phase == 'train':
+            if dataset_opt['type'] == 'ZurichRawBurstDataset':
+                dataset_opt['processing'] = SyntheticBurstProcessing(
+                    (dataset_opt['crop_sz'], dataset_opt['crop_sz']),
+                    dataset_opt['burst_sz'],
+                    dataset_opt['downsample_factor'],
+                    burst_transformation_params={
+                        'max_translation': dataset_opt['max_translation'],
+                        'max_rotation': dataset_opt['max_rotation'],
+                        'max_shear': dataset_opt['max_shear'],
+                        'max_scale': dataset_opt['max_scale'],
+                        'border_crop': dataset_opt['border_crop']
+                    },
+                    transform=tfm.Transform(tfm.ToTensorAndJitter(0.0, normalize=True), tfm.RandomHorizontalFlip()),
+                    image_processing_params={
+                        'random_ccm': dataset_opt['random_ccm'],
+                        'random_gains': dataset_opt['random_gains'],
+                        'smoothstep': dataset_opt['smoothstep'],
+                        'gamma': dataset_opt['gamma'],
+                        'add_noise': dataset_opt['add_noise']
+                    }
+                )
             dataset_enlarge_ratio = dataset_opt.get('dataset_enlarge_ratio', 1)
             train_set = build_dataset(dataset_opt)
             train_sampler = EnlargedSampler(train_set, opt['world_size'], opt['rank'], dataset_enlarge_ratio)

@@ -201,7 +201,8 @@ class SRModel(BaseModel):
             pbar = tqdm(total=len(dataloader), unit='image')
 
         for idx, val_data in enumerate(dataloader):
-            img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
+            # img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
+            img_name = val_data['lq_path'][0][0][-18:-14]
             self.feed_data(val_data)
             self.test()
 

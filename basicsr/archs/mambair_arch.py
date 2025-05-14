@@ -9,7 +9,7 @@ from typing import Optional, Callable
 from basicsr.utils.registry import ARCH_REGISTRY
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 
 
 
@@ -341,7 +341,7 @@ class SS2D(nn.Module):
         L = H * W
         K = 4
         x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1).view(B, 2, -1, L)
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (bt, 4, 360, 2304)
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
@@ -535,7 +535,8 @@ class MambaIR(nn.Module):
                  **kwargs):
         super(MambaIR, self).__init__()
         num_in_ch = in_chans
-        num_out_ch = in_chans
+        in_burst_num = 14
+        num_out_ch = 3
         num_feat = 64
         self.img_range = img_range
         if in_chans == 3:
@@ -543,7 +544,7 @@ class MambaIR(nn.Module):
             self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
         else:
             self.mean = torch.zeros(1, 1, 1, 1)
-        self.upscale = upscale
+        self.upscale = upscale if in_chans == 3 else upscale * 2    # 
         self.upsampler = upsampler
         self.mlp_ratio=mlp_ratio
         # ------------------------- 1, shallow feature extraction ------------------------- #
@@ -616,11 +617,12 @@ class MambaIR(nn.Module):
             # for classical SR
             self.conv_before_upsample = nn.Sequential(
                 nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True))
-            self.upsample = Upsample(upscale, num_feat)
+            self.burst_pooling = BurstPooling(num_feat)
+            self.upsample = Upsample(self.upscale, num_feat)
             self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR (to save parameters)
-            self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch)
+            self.upsample = UpsampleOneStep(self.upscale, embed_dim, num_out_ch)
 
         else:
             # for image denoising
@@ -662,12 +664,14 @@ class MambaIR(nn.Module):
     def forward(self, x):
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
+        b, t, c, h, w = x.shape
 
         if self.upsampler == 'pixelshuffle':
             # for classical SR
-            x = self.conv_first(x)
+            x = self.conv_first(x.view(-1, *x.shape[2:]))   # [bt, c, h, w]
             x = self.conv_after_body(self.forward_features(x)) + x
             x = self.conv_before_upsample(x)
+            x = self.burst_pooling(x.view(b, t, -1, h, w))
             x = self.conv_last(self.upsample(x))
 
         elif self.upsampler == 'pixelshuffledirect':
@@ -892,3 +896,21 @@ class Upsample(nn.Sequential):
         else:
             raise ValueError(f'scale {scale} is not supported. Supported scales: 2^n and 3.')
         super(Upsample, self).__init__(*m)
+
+
+class BurstPooling(nn.Module):
+    # input: [B, T, C, H, W]
+    # output: [B, C, H, W]
+    def __init__(self, in_channels):
+        super(BurstPooling, self).__init__()
+        self.score_layer = nn.Sequential(nn.Conv2d(in_channels, 1, kernel_size=1), nn.SiLU(), nn.AdaptiveAvgPool2d(1))
+    
+    def forward(self, x):
+        B, T, C, H, W = x.size()
+
+        x_reshaped = x.view(B*T, C, H, W) # [BT, C, H, W]
+        scores = self.score_layer(x_reshaped)   # [BT, 1, 1, 1]
+        scores = F.softmax(scores.view(B, T), dim=1)  # [B, T]
+        reduced_x = einsum(x, scores, 'b t c h w, b t -> b c h w')
+        
+        return reduced_x
