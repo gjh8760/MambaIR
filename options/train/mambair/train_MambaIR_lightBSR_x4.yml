@@ -1,7 +1,7 @@
-name: MambaIR_BSR_x4
+name: MambaIR_lightBSR_x4
 model_type: MambaIRModel
 scale: 4
-num_gpu: 1
+num_gpu: 2
 manual_seed: 10
 
 # dataset and data loader settings
@@ -21,8 +21,8 @@ datasets:
 
     # data loader
     use_shuffle: true
-    num_worker_per_gpu: 1
-    batch_size_per_gpu: 1
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 2
     dataset_enlarge_ratio: 1
     prefetch_mode: ~
 
@@ -59,8 +59,8 @@ network_g:
   window_size: 8
   img_range: 1.
   d_state: 10 # 16
-  depths: [6, 6, 6, 6]  # [6, 6, 6, 6, 6, 6]
-  embed_dim: 120  # 180
+  depths: [2, 2, 4, 4, 4]  # [6, 6, 6, 6, 6, 6]
+  embed_dim: 96  # 180
   mlp_ratio: 2
   upsampler: 'pixelshuffle'
   resi_connection: '1conv'

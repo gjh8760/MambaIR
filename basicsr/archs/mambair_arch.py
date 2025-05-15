@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 import torch.nn.functional as F
+from torchvision.ops import DeformConv2d
 from functools import partial
 from typing import Optional, Callable
 from basicsr.utils.registry import ARCH_REGISTRY
@@ -549,8 +550,9 @@ class MambaIR(nn.Module):
         self.mlp_ratio=mlp_ratio
         # ------------------------- 1, shallow feature extraction ------------------------- #
         self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
-
-        # ------------------------- 2, deep feature extraction ------------------------- #
+        # ------------------------- 2, feature alignment with DCN ------------------------- #
+        self.align = DCNAlignment(embed_dim)
+        # ------------------------- 3, deep feature extraction ------------------------- #
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
         self.patch_norm = patch_norm
@@ -669,6 +671,7 @@ class MambaIR(nn.Module):
         if self.upsampler == 'pixelshuffle':
             # for classical SR
             x = self.conv_first(x.view(-1, *x.shape[2:]))   # [bt, c, h, w]
+            x = self.align(x.view(b, t, -1, *x.shape[-2:]))
             x = self.conv_after_body(self.forward_features(x)) + x
             x = self.conv_before_upsample(x)
             x = self.burst_pooling(x.view(b, t, -1, h, w))
@@ -914,3 +917,35 @@ class BurstPooling(nn.Module):
         reduced_x = einsum(x, scores, 'b t c h w, b t -> b c h w')
         
         return reduced_x
+
+
+class DCNAlignment(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        kernel_size = 3
+        padding = kernel_size // 2
+        deform_groups = 8
+        out_channels = deform_groups * 3 * (kernel_size ** 2)
+        self.offset_conv = nn.Conv2d(dim, out_channels, kernel_size, stride=1, padding=padding, bias=False)
+        self.deform = DeformConv2d(dim, dim, kernel_size, padding = 2, groups = deform_groups, dilation=2)
+        self.bottleneck = nn.Sequential(nn.Conv2d(dim*2, dim, kernel_size=3, padding=1, bias=False), nn.GELU())
+    
+    def offset_gen(self, x):
+        o1, o2, mask = torch.chunk(x, 3, dim=1)
+        offset = torch.cat((o1, o2), dim=1)
+        mask = torch.sigmoid(mask)
+
+        return offset, mask
+
+    def forward(self, x):
+        B, T, C, H, W = x.size()
+        ref = x[:, 0].unsqueeze(1)  # [B, 1, C, H, W]
+        ref = torch.repeat_interleave(ref, T, dim=1)    # [B, T, C, H, W]
+        x_ = torch.cat([ref, x], dim=2).view(B*T, -1, *x.shape[-2:])    # [B*T, C*2, H, W]
+        offset_feat = self.bottleneck(x_)   # [B*T, C, H, W]
+        
+        offset, mask = self.offset_gen(self.offset_conv(offset_feat))
+        aligned_feat = self.deform(x.view(B*T, C, H, W), offset, mask).view(B, T, -1, *x.shape[-2:])    # [B, T, C, H, W]
+        aligned_feat[:, 0] = x[:, 0]    # [B, T, C, H, W]
+
+        return aligned_feat.view(B*T, -1, *x.shape[-2:])
