@@ -103,8 +103,10 @@ class BaseModel():
     def get_optimizer(self, optim_type, params, lr, **kwargs):
         if optim_type == 'Adam':
             optimizer = torch.optim.Adam(params, lr, **kwargs)
+        elif optim_type == 'AdamW':
+            optimizer = torch.optim.AdamW(params, lr, **kwargs)
         else:
-            raise NotImplementedError(f'optimizer {optim_type} is not supperted yet.')
+            raise NotImplementedError(f'optimizer {optim_type} is not supported yet.')
         return optimizer
 
     def setup_schedulers(self):
@@ -117,6 +119,9 @@ class BaseModel():
         elif scheduler_type == 'CosineAnnealingRestartLR':
             for optimizer in self.optimizers:
                 self.schedulers.append(lr_scheduler.CosineAnnealingRestartLR(optimizer, **train_opt['scheduler']))
+        elif scheduler_type == 'TrueCosineAnnealingLR':
+            for optimizer in self.optimizers:
+                self.schedulers.append(torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, **train_opt['scheduler']))
         else:
             raise NotImplementedError(f'Scheduler {scheduler_type} is not implemented yet.')
 

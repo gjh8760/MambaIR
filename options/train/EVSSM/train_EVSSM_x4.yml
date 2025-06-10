@@ -1,0 +1,126 @@
+name: EVSSM
+model_type: MambaIRModel
+scale: 4
+num_gpu: 2
+manual_seed: 10
+
+datasets:
+  train:
+    task: BSR
+    name: SyntheticBurst
+    type: ZurichRawBurstDataset
+    dataroot: /data/gjh8760/datasets/Zurich-RAW-to-DSLR-Dataset/train/canon
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+    gt_size: 384
+    use_flip: true
+    use_rot: false
+
+    # data loader
+    use_shuffle: true
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 2
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+    # processing
+    crop_sz: 384
+    burst_sz: 14
+    downsample_factor: 4
+    max_translation: 24.0
+    max_rotation: 1.0
+    max_shear: 0.0
+    max_scale: 0.0
+    border_crop: 24
+    random_ccm: true
+    random_gains: true
+    smoothstep: true
+    gamma: true
+    add_noise: true
+
+  val:
+    name: SyntheticBurstVal
+    type: ZurichRawBurstValDataset
+    dataroot_gt: /data/gjh8760/datasets/SyntheticBurstVal/gt
+    dataroot_lq: /data/gjh8760/datasets/SyntheticBurstVal/bursts
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+# network structures
+network_g:
+  type: EVSSM
+  inp_channels: 4
+  out_channels: 3
+  dim: 48
+  num_blocks: [6,6,12]
+  ffn_expansion_factor: 3
+  bias: False
+  upscale: 4
+  spynet_path: ./pretrained_networks/spynet_20210409-c6c1bd09.pth
+  use_fft: false
+
+# path
+path:
+  pretrain_network_g:
+  strict_load_g: true
+  resume_state:
+
+# training settings
+train:
+  optim_g:
+    type: AdamW  # AdamW
+    lr: !!float 1e-3  # 1e-3
+    weight_decay: !!float 1e-3
+    betas: [0.9, 0.9]
+
+  scheduler:
+    type: TrueCosineAnnealingLR
+    T_max: 300000
+    eta_min: !!float 1e-7
+
+  total_iter: 300000
+  warmup_iter: -1 # no warm up
+
+  # losses
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  # fft_loss_opt:
+  #   type: FFTLoss
+  #   loss_weight: 0.1
+  #   reduction: mean
+
+# validation settings
+val:
+  val_freq: !!float 3e3
+  save_img: false
+
+
+  metrics:
+    psnr: # metric name, can be arbitrary
+      type: calculate_psnr
+      crop_border: 40
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 40
+      test_y_channel: false
+
+# logging settings
+logger:
+  print_freq: 300
+  save_checkpoint_freq: !!float 3e3
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500

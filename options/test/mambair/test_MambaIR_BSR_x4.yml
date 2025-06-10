@@ -1,0 +1,53 @@
+# general settings
+name: test_MambaIR_BSR_x4
+model_type: MambaIRModel
+scale: 4
+num_gpu: 2
+manual_seed: 10
+
+datasets:
+  test_1:  # the 1st test dataset
+    name: SyntheticBurstVal
+    type: ZurichRawBurstValDataset
+    dataroot_gt: /data/gjh8760/datasets/SyntheticBurstVal/gt
+    dataroot_lq: /data/gjh8760/datasets/SyntheticBurstVal/bursts
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+# network structures
+network_g:
+  type: MambaIR
+  upscale: 4
+  in_chans: 4
+  img_size: 48
+  img_range: 1.
+  d_state: 10
+  depths: [6, 6, 6, 6]
+  embed_dim: 120
+  mlp_ratio: 2
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+
+# path
+path:
+  pretrain_network_g: /data/gjh8760/Codes/MambaIR/experiments/MambaIR_BSR_x4/models/net_g_500000.pth
+  strict_load_g: true
+
+# validation settings
+val:
+  save_img: true
+  suffix: ~  # add suffix to saved images, if None, use exp name
+
+  metrics:
+    psnr: # metric name, can be arbitrary
+      type: calculate_psnr
+      crop_border: 40
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 40
+      test_y_channel: false
+    lpips:
+      type: calculate_lpips
+      crop_border: 40

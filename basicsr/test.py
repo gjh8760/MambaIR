@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore")
 import logging
 import torch
 import os

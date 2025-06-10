@@ -391,7 +391,7 @@ class SS2D(nn.Module):
 
 class BOSS2D(SS2D):
     def __init__(self, burst_num=14, **kwargs):
-        super().__init___(**kwargs)
+        super().__init__(**kwargs)
         self.burst_num = burst_num
 
     @staticmethod
@@ -482,14 +482,16 @@ class BOSS2D(SS2D):
         ).view(B, K, -1, L*T)
         assert out_y.dtype == torch.float
 
-        inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
-        wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
-        invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+        inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L*T)
+        wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H, T), dim0=2, dim1=3).contiguous().view(B, -1, L*T)
+        invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H, T), dim0=2, dim1=3).contiguous().view(B, -1, L*T)
 
         return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
 
     def forward(self, x: torch.Tensor, **kwargs):
         B, H, W, C = x.shape
+        T = self.burst_num
+        B = B // T
 
         xz = self.in_proj(x)
         x, z = xz.chunk(2, dim=-1)
@@ -499,7 +501,8 @@ class BOSS2D(SS2D):
         y1, y2, y3, y4 = self.forward_core(x)
         assert y1.dtype == torch.float32
         y = y1 + y2 + y3 + y4
-        y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
+        # y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
+        y = y.view(B, -1, H, W, T).transpose(1, 4).contiguous().view(B*T, H, W, -1)
         y = self.out_norm(y)
         y = y * F.silu(z)
         out = self.out_proj(y)
@@ -542,6 +545,40 @@ class VSSBlock(nn.Module):
         return x
 
 
+class BSSBlock(nn.Module):
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            drop_path: float = 0,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+            attn_drop_rate: float = 0,
+            d_state: int = 16,
+            expand: float = 2.,
+            is_light_sr: bool = False,
+            **kwargs,
+    ):
+        super().__init__()
+        self.ln_1 = norm_layer(hidden_dim)
+        self.self_attention = BOSS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, **kwargs)
+        self.drop_path = DropPath(drop_path)
+        self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
+        self.conv_blk = CAB(hidden_dim,is_light_sr)
+        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
+
+
+
+    def forward(self, input, x_size):
+        # x [B,HW,C]
+        B, L, C = input.shape
+        input = input.view(B, *x_size, C).contiguous()  # [B,H,W,C]
+        x = self.ln_1(input)
+        x = input*self.skip_scale + self.drop_path(self.self_attention(x))
+        x = x*self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
+        x = x.view(B, -1, C).contiguous()
+        return x
+    
+
 class BasicLayer(nn.Module):
     """ The Basic MambaIR Layer in one Residual State Space Group
     Args:
@@ -570,13 +607,22 @@ class BasicLayer(nn.Module):
         self.dim = dim
         self.input_resolution = input_resolution
         self.depth = depth
+        assert depth % 2 == 0, "depth should be even"
         self.mlp_ratio=mlp_ratio
         self.use_checkpoint = use_checkpoint
 
         # build blocks
         self.blocks = nn.ModuleList()
-        for i in range(depth):
+        for i in range(depth // 2):
             self.blocks.append(VSSBlock(
+                hidden_dim=dim,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=nn.LayerNorm,
+                attn_drop_rate=0,
+                d_state=d_state,
+                expand=self.mlp_ratio,
+                input_resolution=input_resolution,is_light_sr=is_light_sr))
+            self.blocks.append(BSSBlock(
                 hidden_dim=dim,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=nn.LayerNorm,
@@ -614,218 +660,7 @@ class BasicLayer(nn.Module):
 
 
 @ARCH_REGISTRY.register()
-class MambaIR(nn.Module):
-    r""" MambaIR Model
-           A PyTorch impl of : `A Simple Baseline for Image Restoration with State Space Model `.
-
-       Args:
-           img_size (int | tuple(int)): Input image size. Default 64
-           patch_size (int | tuple(int)): Patch size. Default: 1
-           in_chans (int): Number of input image channels. Default: 3
-           embed_dim (int): Patch embedding dimension. Default: 96
-           d_state (int): num of hidden state in the state space model. Default: 16
-           depths (tuple(int)): Depth of each RSSG
-           drop_rate (float): Dropout rate. Default: 0
-           drop_path_rate (float): Stochastic depth rate. Default: 0.1
-           norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
-           patch_norm (bool): If True, add normalization after patch embedding. Default: True
-           use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
-           upscale: Upscale factor. 2/3/4 for image SR, 1 for denoising
-           img_range: Image range. 1. or 255.
-           upsampler: The reconstruction reconstruction module. 'pixelshuffle'/None
-           resi_connection: The convolutional block before residual connection. '1conv'/'3conv'
-       """
-    def __init__(self,
-                 img_size=64,
-                 patch_size=1,
-                 in_chans=3,
-                 embed_dim=96,
-                 depths=(6, 6, 6, 6),
-                 drop_rate=0.,
-                 d_state = 16,
-                 mlp_ratio=2.,
-                 drop_path_rate=0.1,
-                 norm_layer=nn.LayerNorm,
-                 patch_norm=True,
-                 use_checkpoint=False,
-                 upscale=2,
-                 img_range=1.,
-                 upsampler='',
-                 resi_connection='1conv',
-                 **kwargs):
-        super(MambaIR, self).__init__()
-        num_in_ch = in_chans
-        in_burst_num = 14
-        num_out_ch = 3
-        num_feat = 64
-        self.img_range = img_range
-        if in_chans == 3:
-            rgb_mean = (0.4488, 0.4371, 0.4040)
-            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
-        else:
-            self.mean = torch.zeros(1, 1, 1, 1)
-        self.upscale = upscale if in_chans == 3 else upscale * 2    # 
-        self.upsampler = upsampler
-        self.mlp_ratio=mlp_ratio
-        # ------------------------- 1, shallow feature extraction ------------------------- #
-        self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
-        # ------------------------- 2, feature alignment with DCN ------------------------- #
-        self.align = DCNAlignment(embed_dim)
-        # ------------------------- 3, deep feature extraction ------------------------- #
-        self.num_layers = len(depths)
-        self.embed_dim = embed_dim
-        self.patch_norm = patch_norm
-        self.num_features = embed_dim
-
-
-        # transfer 2D feature map into 1D token sequence, pay attention to whether using normalization
-        self.patch_embed = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=embed_dim,
-            embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None)
-        num_patches = self.patch_embed.num_patches
-        patches_resolution = self.patch_embed.patches_resolution
-        self.patches_resolution = patches_resolution
-
-        # return 2D feature map from 1D token sequence
-        self.patch_unembed = PatchUnEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=embed_dim,
-            embed_dim=embed_dim,
-            norm_layer=norm_layer if self.patch_norm else None)
-
-        self.pos_drop = nn.Dropout(p=drop_rate)
-        self.is_light_sr = True if self.upsampler=='pixelshuffledirect' else False
-        # stochastic depth
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
-
-        # build Residual State Space Group (RSSG)
-        self.layers = nn.ModuleList()
-        for i_layer in range(self.num_layers): # 6-layer
-            layer = ResidualGroup(
-                dim=embed_dim,
-                input_resolution=(patches_resolution[0], patches_resolution[1]),
-                depth=depths[i_layer],
-                d_state = d_state,
-                mlp_ratio=self.mlp_ratio,
-                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],  # no impact on SR results
-                norm_layer=norm_layer,
-                downsample=None,
-                use_checkpoint=use_checkpoint,
-                img_size=img_size,
-                patch_size=patch_size,
-                resi_connection=resi_connection,
-                is_light_sr = self.is_light_sr
-            )
-            self.layers.append(layer)
-        self.norm = norm_layer(self.num_features)
-
-        # build the last conv layer in the end of all residual groups
-        if resi_connection == '1conv':
-            self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        elif resi_connection == '3conv':
-            # to save parameters and memory
-            self.conv_after_body = nn.Sequential(
-                nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
-
-        # -------------------------3. high-quality image reconstruction ------------------------ #
-        if self.upsampler == 'pixelshuffle':
-            # for classical SR
-            self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True))
-            self.burst_pooling = BurstPooling(num_feat)
-            self.upsample = Upsample(self.upscale, num_feat)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-        elif self.upsampler == 'pixelshuffledirect':
-            # for lightweight SR (to save parameters)
-            self.upsample = UpsampleOneStep(self.upscale, embed_dim, num_out_ch)
-
-        else:
-            # for image denoising
-            self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'absolute_pos_embed'}
-
-    @torch.jit.ignore
-    def no_weight_decay_keywords(self):
-        return {'relative_position_bias_table'}
-
-    def forward_features(self, x):
-        x_size = (x.shape[2], x.shape[3])
-        x = self.patch_embed(x) # N,L,C
-
-        x = self.pos_drop(x)
-
-        for layer in self.layers:
-            x = layer(x, x_size)
-
-        x = self.norm(x)  # b seq_len c
-        x = self.patch_unembed(x, x_size)
-
-        return x
-
-    def forward(self, x):
-        self.mean = self.mean.type_as(x)
-        x = (x - self.mean) * self.img_range
-        b, t, c, h, w = x.shape
-
-        if self.upsampler == 'pixelshuffle':
-            # for classical SR
-            x = self.conv_first(x.view(-1, *x.shape[2:]))   # [bt, c, h, w]
-            x = self.align(x.view(b, t, -1, *x.shape[-2:]))
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample(x)
-            x = self.burst_pooling(x.view(b, t, -1, h, w))
-            x = self.conv_last(self.upsample(x))
-
-        elif self.upsampler == 'pixelshuffledirect':
-            # for lightweight SR
-            x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.upsample(x)
-
-        else:
-            # for image denoising
-            x_first = self.conv_first(x)
-            res = self.conv_after_body(self.forward_features(x_first)) + x_first
-            x = x + self.conv_last(res)
-
-        x = x / self.img_range + self.mean
-
-        return x
-
-    def flops(self):
-        flops = 0
-        h, w = self.patches_resolution
-        flops += h * w * 3 * self.embed_dim * 9
-        flops += self.patch_embed.flops()
-        for layer in self.layers:
-            flops += layer.flops()
-        flops += h * w * 3 * self.embed_dim * self.embed_dim
-        flops += self.upsample.flops()
-        return flops
-
-
-@ARCH_REGISTRY.register()
-class BombaIR(nn.Module):
+class BombaBSR(nn.Module):
     r""" BombaIR Model
            A PyTorch impl of : `BOSS: Burst-order Selective Scan for Burst Super-Resolution`.
 
@@ -864,7 +699,7 @@ class BombaIR(nn.Module):
                  upsampler='',
                  resi_connection='1conv',
                  **kwargs):
-        super(BombaIR, self).__init__()
+        super(BombaBSR, self).__init__()
         num_in_ch = in_chans
         in_burst_num = 14
         num_out_ch = 3

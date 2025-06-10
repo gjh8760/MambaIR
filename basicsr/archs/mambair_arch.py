@@ -348,12 +348,12 @@ class SS2D(nn.Module):
         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
         dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
         xs = xs.float().view(B, -1, L)
-        dts = dts.contiguous().float().view(B, -1, L) # (b, k * d, l)
+        dts = dts.contiguous().float().view(B, -1, L) # (B, K * d_inner, L)
         Bs = Bs.float().view(B, K, -1, L)
-        Cs = Cs.float().view(B, K, -1, L) # (b, k, d_state, l)
-        Ds = self.Ds.float().view(-1)
-        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
-        dt_projs_bias = self.dt_projs_bias.float().view(-1) # (k * d)
+        Cs = Cs.float().view(B, K, -1, L) # (B, K, d_state, L)
+        Ds = self.Ds.float().view(-1)   # (K * d_inner)
+        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state) # (K * d_inner, d_state)
+        dt_projs_bias = self.dt_projs_bias.float().view(-1) # (K * d_inner) -> (K * d_inner)
         out_y = self.selective_scan(
             xs, dts,
             As, Bs, Cs, Ds, z=None,

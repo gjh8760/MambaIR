@@ -63,6 +63,11 @@ class SRModel(BaseModel):
         else:
             self.cri_perceptual = None
 
+        if train_opt.get('fft_loss_opt'):
+            self.cri_fft = build_loss(train_opt['fft_loss_opt']).to(self.device)
+        else:
+            self.cri_fft = None
+
         if self.cri_pix is None and self.cri_perceptual is None:
             raise ValueError('Both pixel and perceptual losses are None.')
 
@@ -89,8 +94,9 @@ class SRModel(BaseModel):
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
 
-    def optimize_parameters(self, current_iter):
-        self.optimizer_g.zero_grad()
+    def optimize_parameters(self, current_iter, backward_only=False):
+        if not backward_only:
+            self.optimizer_g.zero_grad()
         self.output = self.net_g(self.lq)
 
         l_total = 0
@@ -109,14 +115,30 @@ class SRModel(BaseModel):
             if l_style is not None:
                 l_total += l_style
                 loss_dict['l_style'] = l_style
-
+        # fft loss
+        if self.cri_fft:
+            l_fft = self.cri_fft(self.output, self.gt)
+            l_total += l_fft
+            loss_dict['l_fft'] = l_fft
+        
+        # Gradient Accumulation
+        accumulation_steps = self.opt['train'].get('accumulation_steps', 1)
+        l_total = l_total / accumulation_steps
         l_total.backward()
-        self.optimizer_g.step()
+
+        if not backward_only:
+            self.optimizer_g.step()
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
+
+    def step(self):
+        self.optimizer_g.step()
+    
+    def zero_grad(self):
+        self.optimizer_g.zero_grad()
 
     def test(self):
         if hasattr(self, 'net_g_ema'):

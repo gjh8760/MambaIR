@@ -1,7 +1,7 @@
 name: MambaIR_BSR_x4
 model_type: MambaIRModel
 scale: 4
-num_gpu: 1
+num_gpu: 2
 manual_seed: 10
 
 # dataset and data loader settings
@@ -75,6 +75,8 @@ path:
 
 # training settings
 train:
+  accumulation_steps: 4
+
   optim_g:
     type: Adam
     # lr: !!float 2e-4
